@@ -270,6 +270,11 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         while (gpio_get(SPI0_CSn_PIN)) {
             if (time_reached(timeout)) { goto timed_out; }
         }
+        // CS is now low — this slave is selected.  Enable the RS-485 driver
+        // immediately so MISO reaches the bus before the first SCK edge.
+        // The SPI master inserts a ~2 µs CS-setup delay before clocking,
+        // giving the transceiver time to enable.  We must NOT enable before
+        // this point because other slaves may be transmitting on the shared bus.
         enable_RTDP_transceiver();
         // Wait for all bytes to be clocked out.
         while (dma_channel_is_busy(RTDP_dma_tx_chan) ||

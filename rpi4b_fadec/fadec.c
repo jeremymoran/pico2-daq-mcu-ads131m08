@@ -289,6 +289,8 @@ static spsc_ring_t g_ring;
 static atomic_uint_fast64_t g_event_count[N_SLAVES]; /* total DRDY rising edges seen  */
 static atomic_uint_fast64_t g_frame_count[N_SLAVES]; /* frames successfully SPI-read  */
 static atomic_uint_fast64_t g_err_count[N_SLAVES];   /* SPI ioctl errors              */
+static atomic_uint_fast64_t g_hdr_err_count[N_SLAVES]; /* frames dropped: bad header byte */
+static volatile uint8_t     g_last_bad_frame[N_SLAVES][4]; /* first 4 bytes of last bad frame */
 
 /*
  * g_start_ns
@@ -835,11 +837,22 @@ static void *acq_thread(void *arg)
              * This takes < 1 ns — contrast with ~50 µs for gpiod API. */
             gpio_regs[_GPCLR0] = cs_bit[dev];
 
-            /* SPI READ — 16 BYTES
+            /* CS-SETUP DELAY — wait for RP2350 SPI receiver to enable
+             * //////////////////////////////////////////////////////////
+             * The RP2350 SPI slave needs ~1 µs after CS assertion before
+             * it can drive MISO with the correct first byte.  Without this
+             * delay the Pi clocks the first byte before the slave has loaded
+             * its TX register, so byte 0 is undefined/stale — the 0xEB sync
+             * header is never seen.
+             * Busy-wait via now_ns() (vDSO clock_gettime — no syscall,
+             * no scheduler involvement) to keep latency deterministic. */
+            { uint64_t _t0 = now_ns(); while (now_ns() - _t0 < 2000) __asm__ volatile("nop"); }
+
+            /* SPI READ — 13 BYTES
              * /////////////////////
              * ioctl is still a syscall (~15-20 µs kernel overhead) but
              * is unavoidable for userspace SPI.  The actual wire time
-             * is 9.6 µs at 10 MHz (12 bytes x 8 bits / 10e6 bps). */
+             * is 10.4 µs at 10 MHz (13 bytes x 8 bits / 10e6 bps). */
             int ret = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &xfer[dev]);
 
             /* DEASSERT CS — SINGLE 32-BIT REGISTER WRITE
@@ -861,7 +874,10 @@ static void *acq_thread(void *arg)
              * Sign-extend bit 23 into bits 31-24.
              */
             if (rx[dev][0] != 0xEB) {
-                atomic_fetch_add_explicit(&g_err_count[dev], 1,
+                /* Capture first 4 bytes so proc_thread can print them */
+                for (int _b = 0; _b < 4; _b++)
+                    g_last_bad_frame[dev][_b] = rx[dev][_b];
+                atomic_fetch_add_explicit(&g_hdr_err_count[dev], 1,
                                           memory_order_relaxed);
                 continue;
             }
@@ -946,6 +962,12 @@ static void *proc_thread(void *arg)
     uint64_t last_stats_ns = now_ns();
     uint64_t interval_frames[N_SLAVES]; /* frames received in current 1-s window */
     memset(interval_frames, 0, sizeof(interval_frames));
+    /* Snapshots of cumulative acq_thread counters at the last report boundary.
+     * Subtracting the snapshot from the current value gives the per-interval delta. */
+    uint64_t prev_event[N_SLAVES];
+    uint64_t prev_err[N_SLAVES];
+    memset(prev_event, 0, sizeof(prev_event));
+    memset(prev_err,   0, sizeof(prev_err));
 
     sample_frame_t frame; /* temporary storage for one popped frame */
 
@@ -973,10 +995,32 @@ static void *proc_thread(void *arg)
 
                 int any = 0; /* did any slave send data this interval? */
                 for (int i = 0; i < N_SLAVES; i++) {
-                    if (interval_frames[i]) {
+                    /* Sample cumulative acq_thread counters and compute deltas */
+                    uint64_t ev      = atomic_load_explicit(&g_event_count[i],   memory_order_relaxed);
+                    uint64_t spi_err = atomic_load_explicit(&g_err_count[i],     memory_order_relaxed);
+                    uint64_t hdr_err = atomic_load_explicit(&g_hdr_err_count[i], memory_order_relaxed);
+                    uint64_t d_ev      = ev      - prev_event[i];
+                    uint64_t d_spi_err = spi_err - prev_err[i];
+                    prev_event[i] = ev;
+                    prev_err[i]   = spi_err;
+
+                    if (interval_frames[i] || d_ev) {
                         if (!any) printf("[rate] ");
-                        printf("slave%d: %.0f fr/s  ",
-                               i + 1, (double)interval_frames[i] / dt);
+                        if (hdr_err > 0)
+                            printf("slave%d: %.0f fr/s  evts=%llu spi_errs=%llu hdr_errs=%llu(last4=0x%02X 0x%02X 0x%02X 0x%02X)  ",
+                                   i + 1, (double)interval_frames[i] / dt,
+                                   (unsigned long long)d_ev,
+                                   (unsigned long long)d_spi_err,
+                                   (unsigned long long)hdr_err,
+                                   (unsigned)g_last_bad_frame[i][0],
+                                   (unsigned)g_last_bad_frame[i][1],
+                                   (unsigned)g_last_bad_frame[i][2],
+                                   (unsigned)g_last_bad_frame[i][3]);
+                        else
+                            printf("slave%d: %.0f fr/s  evts=%llu spi_errs=%llu  ",
+                                   i + 1, (double)interval_frames[i] / dt,
+                                   (unsigned long long)d_ev,
+                                   (unsigned long long)d_spi_err);
                         any = 1;
                     }
                 }
@@ -1060,9 +1104,11 @@ int main(void)
      */
     memset(&g_ring, 0, sizeof(g_ring));
     for (int i = 0; i < N_SLAVES; i++) {
-        atomic_init(&g_event_count[i], 0);
-        atomic_init(&g_frame_count[i], 0);
-        atomic_init(&g_err_count[i],   0);
+        atomic_init(&g_event_count[i],   0);
+        atomic_init(&g_frame_count[i],   0);
+        atomic_init(&g_err_count[i],     0);
+        atomic_init(&g_hdr_err_count[i], 0);
+        memset((void *)g_last_bad_frame[i], 0, 4);
     }
     atomic_init(&g_dropped, 0);
 
@@ -1155,6 +1201,12 @@ int main(void)
                (unsigned long long)frames,
                (unsigned long long)atomic_load(&g_err_count[i]),
                rate_hz, rate_khz);
+        uint64_t hdr_errs = atomic_load(&g_hdr_err_count[i]);
+        if (hdr_errs)
+            printf("    hdr_errs: %llu (last bad frame bytes: 0x%02X 0x%02X 0x%02X 0x%02X)\n",
+                   (unsigned long long)hdr_errs,
+                   (unsigned)g_last_bad_frame[i][0], (unsigned)g_last_bad_frame[i][1],
+                   (unsigned)g_last_bad_frame[i][2], (unsigned)g_last_bad_frame[i][3]);
     }
     /* g_dropped counts frames the ring buffer was too full to accept */
     printf("  %-22s  dropped (ring full): %llu\n",
