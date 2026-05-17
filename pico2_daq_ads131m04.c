@@ -356,11 +356,11 @@ static inline void set_adc_command(uint16_t cmd)
 
 static inline void write_adc_register(uint8_t reg_addr, uint16_t reg_value)
 // Write a 16-bit value to an ADS131M04 register.
-// The WREG command format is: 010a aaaa annn nnnn
+// The WREG command format is: 011a aaaa annn nnnn
 // where a is the register address and n is the number of registers to write minus 1.
 // For a single register write, n=0.
 {
-    uint16_t cmd = 0x4000 | ((reg_addr & 0x1F) << 7); // WREG command with address
+    uint16_t cmd = 0x6000 | ((reg_addr & 0x3F) << 7); // WREG command with address
     outgoing_bytes_adc[0] = (uint8_t)((cmd & 0xff00) >> 8);
     outgoing_bytes_adc[1] = (uint8_t)(cmd & 0x00ff);
     outgoing_bytes_adc[2] = (uint8_t)((reg_value & 0xff00) >> 8);
@@ -371,7 +371,7 @@ static inline void write_adc_register(uint8_t reg_addr, uint16_t reg_value)
 }
 
 static inline void set_adc_osr(uint32_t OSR)
-// Set the oversampling ratio by writing to the CLOCK register (0x01).
+// Set the oversampling ratio by writing to the CLOCK register (0x03).
 // This function preserves channel enable bits (all enabled) and sets appropriate power mode.
 // OSR values: 64(TBM), 128, 256, 512, 1024, 2048, 4096, 8192, 16256
 {
@@ -401,7 +401,7 @@ static inline void set_adc_osr(uint32_t OSR)
     // Set power mode to High-resolution (bits 1:0 = 10b)
     clock_reg |= 0x0002;
     //
-    write_adc_register(0x01, clock_reg);
+    write_adc_register(0x03, clock_reg);
 }
 
 static inline void read_full_adc_frame()
