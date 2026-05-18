@@ -280,13 +280,9 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
             if (time_reached(timeout)) { goto timed_out; }
         }
         drain_RTDP_spi_rx_fifo();
-        // Preload the 0xEB sync header into the SPI TX FIFO before the
-        // external master sees DATA_RDY. This removes the byte-0 race with
-        // DMA priming and ensures the first byte is already staged when the
-        // first SCK edge arrives.
-        spi_get_hw(spi0)->dr = RTDP_dma_buf[buf_idx][0];
-        // Configure TX DMA to read directly from the pre-packed ping-pong buffer.
-        // Byte 0 is already staged in the TX FIFO; DMA sends bytes 1..12.
+        // Configure TX DMA to read directly from the pre-packed ping-pong
+        // buffer. Byte 0 is written only after CS is asserted so the shared
+        // RS-485 bus remains idle until this slave is selected.
         dma_channel_configure(RTDP_dma_tx_chan, &tx_cfg,
                               &spi_get_hw(spi0)->dr, // write to SPI TX FIFO
                               &RTDP_dma_buf[buf_idx][1], // read remaining bytes
@@ -300,8 +296,6 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
                               &spi_get_hw(spi0)->dr,  // read from SPI RX FIFO
                               RTDP_BUF_BYTES,
                               false); // start later
-        //
-        dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
         assert_data_ready();
         //
         timeout = time_us_64() + timeout_period_us;
@@ -310,12 +304,11 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         while (gpio_get(SPI0_CSn_PIN)) {
             if (time_reached(timeout)) { goto timed_out; }
         }
-        // CS is now low — this slave is selected.  Enable the RS-485 driver
-        // immediately so MISO reaches the bus before the first SCK edge.
-        // The SPI master inserts a ~2 µs CS-setup delay before clocking,
-        // giving the transceiver time to enable.  We must NOT enable before
-        // this point because other slaves may be transmitting on the shared bus.
+        // CS is now low — this slave is selected. Enable the line driver,
+        // stage the sync header, then let DMA feed the remaining bytes.
         enable_RTDP_transceiver();
+        spi_get_hw(spi0)->dr = RTDP_dma_buf[buf_idx][0];
+        dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
         // Wait for all bytes to be clocked out.
         while (dma_channel_is_busy(RTDP_dma_tx_chan) ||
                dma_channel_is_busy(RTDP_dma_rx_chan)) {
