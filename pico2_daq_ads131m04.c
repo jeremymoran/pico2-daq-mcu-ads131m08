@@ -237,7 +237,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
     multicore_fifo_clear_irq();
     //
     uint timeout_period_us = vregister[7];
-    // At 8 MHz (SPI0 slave clock), N_CHAN*3 = 12 bytes transfers in ~12 us.
+    // At 6 MHz (SPI0 slave clock), N_CHAN*3 = 12 bytes transfers in ~16 us.
     // Keep a generous minimum so the master has time to respond to DATA_RDY.
     if (timeout_period_us < 100) timeout_period_us = 100;
     //
@@ -257,8 +257,8 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         //
         if (!my_spi_is_initialized) {
             // (Re-)initialise SPI0 as a slave.
-            // Use 8 MHz for the shared RS-485 RTDP transport.
-            spi_init(spi0, 8000*1000);
+            // Use 6 MHz for the shared RS-485 RTDP transport.
+            spi_init(spi0, 6000*1000);
             spi_set_slave(spi0, true);
             spi_set_format(spi0, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
             gpio_set_function(SPI0_CSn_PIN, GPIO_FUNC_SPI);
