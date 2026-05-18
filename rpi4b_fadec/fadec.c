@@ -239,7 +239,7 @@ static const unsigned int CS_GPIO[N_SLAVES] = {
  *               at a time, but batching avoids extra syscall overhead.
  */
 #define SPI_DEVICE   "/dev/spidev0.0"
-#define SPI_HZ       10000000u   /* 10 MHz                                  */
+#define SPI_HZ       20000000u   /* 20 MHz                                  */
 #define FRAME_BYTES  13u         /* 1 sync header (0xEB) + 4 × 24-bit = 13 bytes */
 #define EVT_BATCH    64          /* edge events per batch read */
 

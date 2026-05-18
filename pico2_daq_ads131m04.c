@@ -21,6 +21,7 @@
 #include "hardware/spi.h"
 #include "hardware/dma.h"
 #include "hardware/pwm.h"
+#include <stdatomic.h>
 #include "pico/binary_info.h"
 #include <stdio.h>
 #include <string.h>
@@ -115,14 +116,25 @@ static inline void clear_data_ready()
 
 static inline void enable_RTDP_transceiver()
 {
-    gpio_put(RTDP_REn_PIN, 0);
-    gpio_put(RTDP_DE_PIN, 1);
+    gpio_put_masked((1u << RTDP_REn_PIN) | (1u << RTDP_DE_PIN),
+                    (1u << RTDP_DE_PIN));
 }
 
 static inline void disable_RTDP_transceiver()
 {
-    gpio_put(RTDP_REn_PIN, 1);
-    gpio_put(RTDP_DE_PIN, 0);
+    gpio_put_masked((1u << RTDP_REn_PIN) | (1u << RTDP_DE_PIN),
+                    (1u << RTDP_REn_PIN));
+}
+
+static inline void drain_RTDP_spi_rx_fifo(void)
+{
+    spi_hw_t *spi_hw = spi_get_hw(spi0);
+    while (spi_hw->sr & (1u << 4)) {
+        tight_loop_contents();
+    }
+    while (spi_hw->sr & (1u << 2)) {
+        (void)spi_hw->dr;
+    }
 }
 
 // Unlike the AVR DAQ firmware, we are going to hard-code the number of
@@ -196,6 +208,19 @@ static volatile uint RTDP_status;
 #define RTDP_BUSY    1
 #define RTDP_STOPPED 2
 
+static inline void RTDP_status_store(uint status)
+{
+    atomic_thread_fence(memory_order_release);
+    RTDP_status = status;
+}
+
+static inline uint RTDP_status_load(void)
+{
+    uint status = RTDP_status;
+    atomic_thread_fence(memory_order_acquire);
+    return status;
+}
+
 void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
 {
     // DMA channels were claimed by core0 (RTDP_dma_tx_chan / RTDP_dma_rx_chan).
@@ -208,6 +233,8 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
     channel_config_set_transfer_data_size(&rx_cfg, DMA_SIZE_8);
     channel_config_set_read_increment(&rx_cfg, false);
     channel_config_set_write_increment(&rx_cfg, false); // drain into single dummy byte
+    multicore_fifo_drain();
+    multicore_fifo_clear_irq();
     //
     uint timeout_period_us = vregister[7];
     // At 20 MHz (SPI0 slave clock), N_CHAN*3 = 12 bytes transfers in ~4.8 us.
@@ -221,6 +248,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         if (msg == RTDP_FIFO_STOP) {
             break;
         }
+        uint64_t timeout = time_us_64() + timeout_period_us;
         //
         // msg is a ping-pong buffer index (0 or 1).
         // core0 has already packed the ADC samples as big-endian bytes into
@@ -245,12 +273,24 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
             channel_config_set_dreq(&rx_cfg, spi_get_dreq(spi0, false)); // rx
             my_spi_is_initialized = true;
         }
+        // Require the master to be deselected before advertising a fresh frame.
+        // This prevents a timed-out, still-low CS from aliasing into the next
+        // transfer as if it were a new chip-select assertion.
+        while (!gpio_get(SPI0_CSn_PIN)) {
+            if (time_reached(timeout)) { goto timed_out; }
+        }
+        drain_RTDP_spi_rx_fifo();
+        // Preload the 0xEB sync header into the SPI TX FIFO before the
+        // external master sees DATA_RDY. This removes the byte-0 race with
+        // DMA priming and ensures the first byte is already staged when the
+        // first SCK edge arrives.
+        spi_get_hw(spi0)->dr = RTDP_dma_buf[buf_idx][0];
         // Configure TX DMA to read directly from the pre-packed ping-pong buffer.
-        // No copy needed: core0 wrote big-endian bytes straight into this buffer.
+        // Byte 0 is already staged in the TX FIFO; DMA sends bytes 1..12.
         dma_channel_configure(RTDP_dma_tx_chan, &tx_cfg,
                               &spi_get_hw(spi0)->dr, // write to SPI TX FIFO
-                              RTDP_dma_buf[buf_idx], // read from ping-pong buffer
-                              RTDP_BUF_BYTES,
+                              &RTDP_dma_buf[buf_idx][1], // read remaining bytes
+                              RTDP_BUF_BYTES - 1,
                               false); // start later
         // Configure RX DMA to drain the SPI RX FIFO into a dummy byte.
         // The PL022 is full-duplex: without draining, the RX FIFO fills after
@@ -264,7 +304,7 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         dma_start_channel_mask((1u << RTDP_dma_tx_chan) | (1u << RTDP_dma_rx_chan));
         assert_data_ready();
         //
-        uint64_t timeout = time_us_64() + timeout_period_us;
+        timeout = time_us_64() + timeout_period_us;
         // Wait for the SPI master to assert chip-select.
         // If this does not happen in time, the master is absent or not listening.
         while (gpio_get(SPI0_CSn_PIN)) {
@@ -285,16 +325,23 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
         while (!gpio_get(SPI0_CSn_PIN)) {
             if (time_reached(timeout)) { goto timed_out; }
         }
+        drain_RTDP_spi_rx_fifo();
         goto finish;
     timed_out:
         dma_channel_cleanup(RTDP_dma_tx_chan);
         dma_channel_cleanup(RTDP_dma_rx_chan);
         spi_deinit(spi0);
         my_spi_is_initialized = false;
+        // Do not return RTDP to IDLE until the master has released CS, or we
+        // have waited an additional timeout window trying to observe that.
+        timeout = time_us_64() + timeout_period_us;
+        while (!gpio_get(SPI0_CSn_PIN)) {
+            if (time_reached(timeout)) { break; }
+        }
     finish:
         disable_RTDP_transceiver();
         clear_data_ready();
-        RTDP_status = RTDP_IDLE;
+        RTDP_status_store(RTDP_IDLE);
     } // end while
     //
     // Cleanup on receiving RTDP_FIFO_STOP.
@@ -304,7 +351,9 @@ void __no_inline_not_in_flash_func(core1_service_RTDP)(void)
     dma_channel_cleanup(RTDP_dma_tx_chan);
     dma_channel_cleanup(RTDP_dma_rx_chan);
     clear_data_ready();
-    RTDP_status = RTDP_STOPPED; // Signal core0 that cleanup is complete.
+    multicore_fifo_drain();
+    multicore_fifo_clear_irq();
+    RTDP_status_store(RTDP_STOPPED); // Signal core0 that cleanup is complete.
 } // end void core1_service_RTDP()
 
 //
@@ -450,6 +499,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
 // Returns 0 on success, non-zero if the ADS131M04 does not have data ready when expected.
 //
 {
+    int result = 0;
     // Get configuration data from virtual registers.
     uint32_t f_CLKIN_kHz = vregister[0];
     uint32_t OSR = vregister[1];
@@ -466,11 +516,13 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     bool service_RTDP = (vregister[7] != 0);
     if (service_RTDP) {
         RTDP_write_buf_idx = 0;
-        RTDP_status = RTDP_IDLE;
+        RTDP_status_store(RTDP_IDLE);
         // Claim DMA channels here in core0 scope so they can be unclaimed
         // cleanly after core1 is reset, without relying on core1 to do it.
         RTDP_dma_tx_chan = dma_claim_unused_channel(true);
         RTDP_dma_rx_chan = dma_claim_unused_channel(true);
+        multicore_fifo_drain();
+        multicore_fifo_clear_irq();
         multicore_launch_core1(core1_service_RTDP);
     }
     //
@@ -500,14 +552,20 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     set_adc_osr(OSR);
     // After writing a register, wait for response with a generous timeout.
     uint64_t timeout = time_us_64() + 10000; // 10ms timeout
-    if (wait_for_adc_data_ready(timeout)) return 4;
+    if (wait_for_adc_data_ready(timeout)) {
+        result = 4;
+        goto sample_cleanup;
+    }
     busy_wait_us(1);
     read_full_adc_frame(); // Read response frame from register write.
     //
     // Assert the SYNCHn pin to reset the ADS131M04 and activate the new OSR setting.
     timeout = time_us_64() + 10;
     uint64_t period_CLKIN_ns = 1000000 / f_CLKIN_kHz;
-    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) return 99;
+    if (assert_adc_synch(3*period_CLKIN_ns, timeout)) {
+        result = 99;
+        goto sample_cleanup;
+    }
     //
     // After SYNC, the filter needs time to settle based on the OSR value.
     // Per datasheet Table 7-15, settling times vary by OSR (in CLKIN cycles):
@@ -534,7 +592,10 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
     busy_wait_us(settling_time_us);
     for (int i = 0; i < 3; i++) {
         timeout = time_us_64() + sample_period_us + 1000;
-        if (wait_for_adc_data_ready(timeout)) return (1 + i);
+        if (wait_for_adc_data_ready(timeout)) {
+            result = (1 + i);
+            goto sample_cleanup;
+        }
         busy_wait_us(1);
         read_full_adc_frame();
     }
@@ -546,7 +607,10 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         // Take the analog sample set.
         // Keep timeout tight to avoid FIFO issues (max 2 samples in FIFO)
         timeout = time_us_64() + sample_period_us + 1000;
-        if (wait_for_adc_data_ready(timeout)) return 3;
+        if (wait_for_adc_data_ready(timeout)) {
+            result = 3;
+            goto sample_cleanup;
+        }
         busy_wait_us(1);
         read_full_adc_frame();
         unpack_adc_sample_data();
@@ -554,7 +618,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
             data[next_fullword_index_in_data+ch] = sample_data[ch];
         }
         //
-        if (service_RTDP && RTDP_status == RTDP_IDLE) {
+        if (service_RTDP && RTDP_status_load() == RTDP_IDLE) {
             uint32_t idx = RTDP_write_buf_idx;
             // Pack the 0xEB sync header followed by ADC samples as
             // 3-byte big-endian (24-bit) values, one per channel.
@@ -564,7 +628,7 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
                 RTDP_dma_buf[idx][1 + 3*ch+1] = (uint8_t)(sample_data[ch] >> 8);
                 RTDP_dma_buf[idx][1 + 3*ch+2] = (uint8_t)(sample_data[ch]);
             }
-            RTDP_status = RTDP_BUSY; // Mark before push so core1 sees BUSY immediately.
+            RTDP_status_store(RTDP_BUSY); // Mark before push so core1 sees BUSY immediately.
             multicore_fifo_push_blocking(idx); // FIFO is empty when RTDP_IDLE, so no stall.
             RTDP_write_buf_idx ^= 1u;   // Switch to the other buffer for next sample.
         }
@@ -608,22 +672,26 @@ int __no_inline_not_in_flash_func(sample_channels)(void)
         sampling_LED_OFF();
     } // end while (main sampling loop)
     //
+sample_cleanup:
     if (service_RTDP) {
         // Wait for any in-progress transfer to complete.
-        while (RTDP_status == RTDP_BUSY) { tight_loop_contents(); }
+        while (RTDP_status_load() == RTDP_BUSY) { tight_loop_contents(); }
         // Send the stop sentinel.  core1 will clean up the SPI peripheral and
         // DMA channel state, then set RTDP_STOPPED so we know it is safe to
         // unclaim the channels.
         multicore_fifo_push_blocking(RTDP_FIFO_STOP);
-        while (RTDP_status != RTDP_STOPPED) { tight_loop_contents(); }
+        while (RTDP_status_load() != RTDP_STOPPED) { tight_loop_contents(); }
         multicore_reset_core1();
+        multicore_fifo_drain();
+        multicore_fifo_clear_irq();
         dma_channel_unclaim(RTDP_dma_tx_chan);
         dma_channel_unclaim(RTDP_dma_rx_chan);
     }
     //
+    lower_flag_pin();
+    sampling_LED_OFF();
     pwm_set_enabled(slice_num, false);
-    // If we arrive here, there have been no observed failures.
-    return 0;
+    return result;
 } // end int sample_channels()
 
 void sample_channels_once()
