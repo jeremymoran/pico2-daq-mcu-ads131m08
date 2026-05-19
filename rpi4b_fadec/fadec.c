@@ -109,6 +109,7 @@
  * frame type (sample_frame_t) shared between the two threads.
  */
 #include "fadec.h"
+#include "unstart.h"
 #include "../rtdp.h"
 
 /* STANDARD C LIBRARY HEADERS */
@@ -306,6 +307,7 @@ static volatile uint8_t     g_last_bad_frame[N_SLAVES][FRAME_BYTES]; /* full las
  */
 static uint64_t g_start_ns;
 static atomic_uint_fast64_t g_dropped;               /* frames dropped (ring was full)*/
+static unstart_runtime_t g_unstart;
 
 
 /* //////////////////////////////////////////////////////////////////////////
@@ -805,6 +807,8 @@ static void *acq_thread(void *arg)
      * plain asm) because -std=c11 does not expose the asm keyword, but
      * __asm__ is a GCC built-in always available regardless of -std.
      */
+    uint8_t ready_ports[N_SLAVES];
+
     while (g_running) {
         uint32_t drdy_now  = gpio_regs[_GPLEV0];
         uint32_t new_edges = (drdy_now ^ drdy_prev) & drdy_now; /* rising edges */
@@ -815,9 +819,20 @@ static void *acq_thread(void *arg)
             continue;
         }
 
-        /* SERVICE EACH SLAVE THAT HAS A NEW DRDY RISING EDGE */
+        /* SERVICE READY SLAVES USING THE CURRENT MAJOR/MINOR-FRAME ORDER. */
+        uint32_t ready_mask = 0;
+        unsigned int ready_count;
+
         for (int dev = 0; dev < N_SLAVES; dev++) {
-            if (!(new_edges & drdy_bit[dev])) continue;
+            if (new_edges & drdy_bit[dev])
+                ready_mask |= (1u << dev);
+        }
+
+        ready_count = unstart_order_ready_ports(&g_unstart, now_ns(), ready_mask,
+                                                ready_ports, N_SLAVES);
+
+        for (unsigned int ready = 0; ready < ready_count; ready++) {
+            int dev = (int)ready_ports[ready];
 
             /* Timestamp at the moment we detect the edge.
              * Using now_ns() here (CLOCK_MONOTONIC) rather than a
@@ -1048,6 +1063,9 @@ static void *proc_thread(void *arg)
 
         /* WE HAVE A FRAME — UPDATE STATISTICS AND PRINT IT */
         int dev = (int)frame.device_id;
+
+        unstart_on_frame(&g_unstart, &frame);
+
         if (dev >= 0 && dev < N_SLAVES)
             interval_frames[dev]++; /* count for rate report */
 
@@ -1077,7 +1095,7 @@ static void *proc_thread(void *arg)
  *   1. Installs signal handlers for clean shutdown.
  *   2. Initialises shared data structures.
  *   3. Spawns the two worker threads.
- *   4. Sleeps (pause()) until Ctrl+C.
+ *   4. Sleeps in a light wait loop until shutdown is requested.
  *   5. Joins both threads to wait for them to finish.
  *   6. Prints a final summary.
  *
@@ -1114,8 +1132,17 @@ int main(void)
     }
     atomic_init(&g_dropped, 0);
 
+    unstart_config_t unstart_cfg = {
+        .port_count = N_SLAVES,
+        .spi_hz = SPI_HZ,
+        .frame_bytes = FRAME_BYTES,
+        .cs_setup_delay_ns = CS_SETUP_DELAY_NS,
+    };
+
+    unstart_init(&g_unstart, &unstart_cfg, now_ns());
+
     printf("FADEC RTDP master\n");
-    printf("cores: acq=1 (FIFO/99)  proc=2 (FIFO/50)\n\n");
+    printf("cores: acq=1 (FIFO/99)  proc=2 (FIFO/50)  unstart=3\n\n");
 
     /* SPAWN THE TWO WORKER THREADS
      * //////////////////////////////
@@ -1127,7 +1154,12 @@ int main(void)
      * if acq_thread started first and immediately filled the ring,
      * proc_thread would drop frames during its startup phase.
      */
-    pthread_t t_acq, t_proc;
+    pthread_t t_acq, t_proc, t_unstart;
+    int unstart_started = 0;
+    unstart_thread_args_t unstart_args = {
+        .runtime = &g_unstart,
+        .running = &g_running,
+    };
 
     /* Stamp the start time immediately before spawning threads so the
      * elapsed-time denominator in the final rate calculation is accurate. */
@@ -1137,22 +1169,31 @@ int main(void)
         perror("pthread_create proc");
         return EXIT_FAILURE;
     }
+    if (pthread_create(&t_unstart, NULL, unstart_thread, &unstart_args) != 0) {
+        perror("pthread_create unstart (continuing with fixed schedule)");
+    } else {
+        unstart_started = 1;
+    }
     if (pthread_create(&t_acq, NULL, acq_thread, NULL) != 0) {
         perror("pthread_create acq");
         /* Signal proc_thread to exit since acq_thread won't start */
         g_running = 0;
+        if (unstart_started)
+            pthread_join(t_unstart, NULL);
         pthread_join(t_proc, NULL);
         return EXIT_FAILURE;
     }
 
-    /* WAIT FOR CTRL+C / SIGTERM
-     * //////////////////////////
-     * pause() suspends the calling thread until any signal is received.
-     * When sig_handler() fires it sets g_running = 0 and returns.
-     * pause() then returns (with errno == EINTR) and the while condition
-     * is checked — if g_running is now 0, we fall through to cleanup.
+    /* WAIT FOR SHUTDOWN
+     * //////////////////
+     * Signals still request shutdown via sig_handler(), but unstart may also
+     * stop the program after its timed capture window. A short sleep loop lets
+     * main observe either path without touching the acquisition hot loop.
      */
-    while (g_running) pause();
+    while (g_running) {
+        struct timespec pause = { .tv_sec = 0, .tv_nsec = 50000000L };
+        nanosleep(&pause, NULL);
+    }
 
     /* INITIATE SHUTDOWN AND WAIT FOR BOTH THREADS
      * /////////////////////////////////////////////
@@ -1165,6 +1206,8 @@ int main(void)
     g_running = 0;
     pthread_join(t_acq,  NULL);
     pthread_join(t_proc, NULL);
+    if (unstart_started)
+        pthread_join(t_unstart, NULL);
 
     /* FINAL SUMMARY
      * //////////////
@@ -1215,6 +1258,14 @@ int main(void)
     /* g_dropped counts frames the ring buffer was too full to accept */
     printf("  %-22s  dropped (ring full): %llu\n",
            "", (unsigned long long)atomic_load(&g_dropped));
+
+    {
+        int unstart_save = unstart_save_timing_log(&g_unstart);
+        if (unstart_save < 0)
+            perror("[unstart] save timing log");
+        else if (unstart_save > 0)
+            printf("[unstart] timing log saved to %s\n", UNSTART_TIMING_LOG_PATH);
+    }
 
     return EXIT_SUCCESS;
 }

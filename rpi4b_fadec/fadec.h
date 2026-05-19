@@ -1,3 +1,6 @@
+#ifndef FADEC_H
+#define FADEC_H
+
 // rtdp_ringbuf.h
 #include <stdint.h>
 #include <stdatomic.h>
@@ -41,3 +44,5 @@ static inline int ring_pop(spsc_ring_t* r, sample_frame_t* f)
     atomic_store_explicit(&r->tail, tail + 1, memory_order_release);
     return 0;
 }
+
+#endif
